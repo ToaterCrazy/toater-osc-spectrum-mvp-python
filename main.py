@@ -1,3 +1,4 @@
+import argparse
 from collections import deque
 from threading import Lock
 
@@ -6,6 +7,7 @@ import numpy as np
 import sounddevice as sd
 
 import utils
+from tuner import TunerTracker, TunerWindow
 
 
 SAMPLE_RATE = 48000
@@ -15,9 +17,15 @@ DISPLAY_SAMPLES = 1024
 INPUT_DEVICE = 1
 SPECTRUM_SMOOTHING_SECONDS = 0.15
 SPECTRUM_FLOOR_DB = -100
+TUNER_REFERENCE_HZ = 440
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Synth oscilloscope and spectrum")
+    parser.add_argument("-tuner", "--tuner", action="store_true",
+                        help="also open the note and cents tuner window")
+    args = parser.parse_args(argv)
+
     buffer = deque(np.zeros(BUFFER_SAMPLES), maxlen=BUFFER_SAMPLES)
     buffer_lock = Lock()
     samples_received = 0
@@ -59,6 +67,9 @@ def main():
     ax_fft.set_xlabel("Frequency [Hz]")
     ax_fft.set_ylabel("Magnitude [dBFS]")
 
+    tuner = TunerWindow(reference_hz=TUNER_REFERENCE_HZ) if args.tuner else None
+    pitch_tracker = TunerTracker(reference_hz=TUNER_REFERENCE_HZ)
+
     last_samples_received = 0
     try:
         with sd.InputStream(
@@ -69,7 +80,8 @@ def main():
             callback=audio_callback,
         ):
             while (plt.fignum_exists(fig_wave.number)
-                   and plt.fignum_exists(fig_fft.number)):
+                   and plt.fignum_exists(fig_fft.number)
+                   and (tuner is None or plt.fignum_exists(tuner.figure.number))):
                 with buffer_lock:
                     received = samples_received
                     samples = (
@@ -81,14 +93,22 @@ def main():
                     cycle, frequency = utils.trigger_waveform(
                         samples, SAMPLE_RATE, DISPLAY_SAMPLES
                     )
+                    elapsed_seconds = (received - last_samples_received) / SAMPLE_RATE
+                    reading = (
+                        tuner.update(frequency, elapsed_seconds) if tuner is not None
+                        else pitch_tracker.update(frequency, elapsed_seconds)
+                    )
                     if cycle is None:
                         wave_line.set_ydata(np.full(DISPLAY_SAMPLES, np.nan))
                         ax_wave.set_title("Oscilloscope — no stable periodic signal")
                     else:
                         wave_line.set_ydata(cycle)
-                        ax_wave.set_title(f"Oscilloscope — two cycles, {frequency:.1f} Hz")
+                        cents = 0.0 if abs(reading.cents) < 0.05 else reading.cents
+                        ax_wave.set_title(
+                            f"Oscilloscope — two cycles, {frequency:.1f} Hz"
+                            f" | {reading.note} {cents:+.1f} cents"
+                        )
 
-                    elapsed_seconds = (received - last_samples_received) / SAMPLE_RATE
                     fft_line.set_ydata(analyzer.process(samples, elapsed_seconds))
                     last_samples_received = received
                     fig_wave.canvas.draw_idle()
@@ -96,12 +116,16 @@ def main():
 
                 fig_wave.canvas.flush_events()
                 fig_fft.canvas.flush_events()
+                if tuner is not None:
+                    tuner.figure.canvas.flush_events()
                 plt.pause(0.01)
     except KeyboardInterrupt:
         pass
     finally:
         plt.close(fig_wave)
         plt.close(fig_fft)
+        if tuner is not None:
+            plt.close(tuner.figure)
 
 
 if __name__ == "__main__":
