@@ -1,138 +1,108 @@
+from collections import deque
+from threading import Lock
+
+import matplotlib.pyplot as plt
 import numpy as np
 import sounddevice as sd
-import matplotlib.pyplot as plt
-from collections import deque
-import utils as utils
 
-# print(sd.query_devices())
+import utils
+
 
 SAMPLE_RATE = 48000
 BLOCK_SIZE = 1024
-
-# How much audio to show in oscilloscope
-DISPLAY_SAMPLES = 2048*4
-
-buffer = deque(
-    np.zeros(DISPLAY_SAMPLES),
-    maxlen=DISPLAY_SAMPLES
-)
+BUFFER_SAMPLES = 8192
+DISPLAY_SAMPLES = 1024
+INPUT_DEVICE = 1
+SPECTRUM_SMOOTHING_SECONDS = 0.15
+SPECTRUM_FLOOR_DB = -100
 
 
-def audio_callback(indata, frames, time, status):
-    if status:
-        print(status)
+def main():
+    buffer = deque(np.zeros(BUFFER_SAMPLES), maxlen=BUFFER_SAMPLES)
+    buffer_lock = Lock()
+    samples_received = 0
 
-    # Take channel 1
-    samples = indata[:, 0]
+    def audio_callback(indata, frames, time, status):
+        nonlocal samples_received
+        if status:
+            print(status)
+        with buffer_lock:
+            buffer.extend(indata[:, 0])
+            samples_received += frames
 
-    buffer.extend(samples)
+    plt.ion()
+    fig_wave, ax_wave = plt.subplots()
+    fig_wave.canvas.manager.set_window_title("Waveform")
+    phase = np.linspace(0, 2, DISPLAY_SAMPLES)
+    wave_line, = ax_wave.plot(phase, np.zeros(DISPLAY_SAMPLES))
+    ax_wave.set_ylim(-1, 1)
+    ax_wave.set_xlim(0, 2)
+    ax_wave.set_title("Oscilloscope — waiting for a periodic signal")
+    ax_wave.set_xlabel("Phase [cycles]")
+    ax_wave.set_ylabel("Amplitude")
+
+    analyzer = utils.SpectrumAnalyzer(
+        BUFFER_SAMPLES, SAMPLE_RATE,
+        smoothing_seconds=SPECTRUM_SMOOTHING_SECONDS,
+        floor_db=SPECTRUM_FLOOR_DB,
+    )
+    fig_fft, ax_fft = plt.subplots()
+    fig_fft.canvas.manager.set_window_title("Spectrum")
+    fft_line, = ax_fft.plot(
+        analyzer.frequencies,
+        np.full(len(analyzer.frequencies), SPECTRUM_FLOOR_DB),
+    )
+    ax_fft.set_xlim(20, 20000)
+    ax_fft.set_xscale("log")
+    ax_fft.set_ylim(SPECTRUM_FLOOR_DB, 0)
+    ax_fft.set_title("Spectrum")
+    ax_fft.set_xlabel("Frequency [Hz]")
+    ax_fft.set_ylabel("Magnitude [dBFS]")
+
+    last_samples_received = 0
+    try:
+        with sd.InputStream(
+            device=INPUT_DEVICE,
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            blocksize=BLOCK_SIZE,
+            callback=audio_callback,
+        ):
+            while (plt.fignum_exists(fig_wave.number)
+                   and plt.fignum_exists(fig_fft.number)):
+                with buffer_lock:
+                    received = samples_received
+                    samples = (
+                        np.array(buffer)
+                        if received != last_samples_received else None
+                    )
+
+                if samples is not None:
+                    cycle, frequency = utils.trigger_waveform(
+                        samples, SAMPLE_RATE, DISPLAY_SAMPLES
+                    )
+                    if cycle is None:
+                        wave_line.set_ydata(np.full(DISPLAY_SAMPLES, np.nan))
+                        ax_wave.set_title("Oscilloscope — no stable periodic signal")
+                    else:
+                        wave_line.set_ydata(cycle)
+                        ax_wave.set_title(f"Oscilloscope — two cycles, {frequency:.1f} Hz")
+
+                    elapsed_seconds = (received - last_samples_received) / SAMPLE_RATE
+                    fft_line.set_ydata(analyzer.process(samples, elapsed_seconds))
+                    last_samples_received = received
+                    fig_wave.canvas.draw_idle()
+                    fig_fft.canvas.draw_idle()
+
+                fig_wave.canvas.flush_events()
+                fig_fft.canvas.flush_events()
+                plt.pause(0.01)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        plt.close(fig_wave)
+        plt.close(fig_fft)
 
 
-# ----------------------------
-# Plot setup
-# ----------------------------
-
-plt.ion()
-
-fig_wave, ax_wave = plt.subplots()
-fig_wave.canvas.manager.set_window_title("Waveform")
-
-x_wave = np.arange(DISPLAY_SAMPLES)
-
-wave_line, = ax_wave.plot(
-    x_wave,
-    np.zeros(DISPLAY_SAMPLES)
-)
-
-ax_wave.set_ylim(-1, 1)
-ax_wave.set_xlim(0, DISPLAY_SAMPLES)
-ax_wave.set_title("Oscilloscope")
-
-
-fig_fft, ax_fft = plt.subplots()
-fig_fft.canvas.manager.set_window_title("Spectrum")
-
-freqs = np.fft.rfftfreq(
-    DISPLAY_SAMPLES,
-    1 / SAMPLE_RATE
-)
-
-fft_line, = ax_fft.plot(
-    freqs,
-    np.zeros(len(freqs))
-)
-
-ax_fft.set_xlim(20, 20000)
-ax_fft.set_xscale("log")
-
-ax_fft.set_ylim(-100, 0)
-
-ax_fft.set_title("Spectrum")
-ax_fft.set_xlabel("Frequency [Hz]")
-ax_fft.set_ylabel("Magnitude [dB]")
-
-
-# ----------------------------
-# Audio stream
-# ----------------------------
-
-with sd.InputStream(
-    device=1,
-    samplerate=SAMPLE_RATE,
-    channels=1,
-    blocksize=BLOCK_SIZE,
-    callback=audio_callback
-):
-
-    while True:
-
-        samples = np.array(buffer)
-
-
-        # ----------------
-        # Waveform
-        # ----------------
-
-        # display_samples = utils.trigger_waveform(samples)
-        # wave_line.set_ydata(display_samples)
-
-        wave_line.set_ydata(samples)
-
-        fig_wave.canvas.draw_idle()
-        fig_wave.canvas.flush_events()
-
-
-        # ----------------
-        # FFT
-        # ----------------
-
-        # Apply window before FFT
-        window = np.hanning(len(samples))
-
-        spectrum = np.fft.rfft(
-            samples * window
-        )
-
-        magnitude = np.abs(spectrum)
-
-        # Avoid log(0)
-        magnitude = np.maximum(
-            magnitude,
-            1e-10
-        )
-
-        magnitude_db = (
-            20 * np.log10(magnitude)
-        )
-
-        # Normalize display
-        magnitude_db -= np.max(magnitude_db)
-
-        fft_line.set_ydata(
-            magnitude_db
-        )
-
-        fig_fft.canvas.draw_idle()
-        fig_fft.canvas.flush_events()
-
-        plt.pause(0.01)
+if __name__ == "__main__":
+    main()
