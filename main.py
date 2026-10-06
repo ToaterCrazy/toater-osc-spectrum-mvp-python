@@ -45,6 +45,8 @@ def main(argv=None):
     wave_line, = ax_wave.plot(phase, np.zeros(DISPLAY_SAMPLES))
     ax_wave.set_ylim(-1, 1)
     ax_wave.set_xlim(0, 2)
+    for position in (0.5, 1.5):
+        ax_wave.axvline(position, color="grey", linestyle=":", linewidth=1, zorder=1)
     ax_wave.set_title("Oscilloscope — waiting for a periodic signal")
     ax_wave.set_xlabel("Phase [cycles]")
     ax_wave.set_ylabel("Amplitude")
